@@ -251,7 +251,7 @@ def test_write_wrong_sequence_length():
             writer.write((2, "two", "extra"))
 
         # Clean up properly since validation happens before buffer append
-        writer._writer.close()
+        writer._stream_writer.close()
         writer._sink.close()
 
 
@@ -275,3 +275,60 @@ def test_write_batch():
         assert table.num_rows == 3
         assert table.column("x").to_pylist() == [1, 2, 3]
         assert table.column("y").to_pylist() == [1.0, 2.0, 3.0]
+
+
+def test_metadata_on_close():
+    """Test that metadata is written to parquet file on close."""
+    schema = pa.schema([("id", pa.int64())])
+    metadata = {"created_by": "test_suite", "version": "1.0"}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "test.parquet"
+        writer = StreamingParquetWriter(path, schema, metadata=metadata)
+        writer.write({"id": 1})
+
+        writer.close(delete_ipc=True)
+
+        assert path.exists()
+        with pq.ParquetFile(path) as pf:
+            file_metadata = pf.metadata.metadata
+            assert file_metadata is not None
+            assert file_metadata[b"created_by"] == b"test_suite"
+            assert file_metadata[b"version"] == b"1.0"
+
+
+def test_metadata_recovery_after_crash():
+    """Test metadata recovery via stream_to_parquet after simulated crash."""
+    schema = pa.schema([("val", pa.int64())])
+    metadata = {"source": "crash_recovery", "run_id": "12345"}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "output.parquet"
+        ipc_path = Path(tmpdir) / "output.arrows"
+        metadata_path = Path(tmpdir) / "output.parquet_metadata"
+
+        # Create writer and write data (but don't close - simulate crash)
+        writer = StreamingParquetWriter(path, schema, metadata=metadata, batch_size=1)
+        writer.write({"val": 42})  # batch_size=1 so this flushes immediately
+
+        # Verify metadata file was created
+        assert metadata_path.exists()
+
+        # Close the stream writer manually (simulating crash recovery process)
+        writer._stream_writer.close()
+        writer._sink.close()
+
+        # Now use stream_to_parquet to recover
+        count = StreamingParquetWriter.stream_to_parquet(
+            ipc_path, path, detect_metadata_file=True
+        )
+
+        assert count == 1
+        assert path.exists()
+
+        # Verify metadata was recovered
+        with pq.ParquetFile(path) as pf:
+            file_metadata = pf.metadata.metadata
+            assert file_metadata is not None
+            assert file_metadata[b"source"] == b"crash_recovery"
+            assert file_metadata[b"run_id"] == b"12345"

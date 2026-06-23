@@ -40,22 +40,25 @@ class StreamingParquetWriter:
     """
 
     path: Path
-    schema: pa.schema
+    schema: pa.Schema
     batch_size: int
     rowgroup_size: int
     do_fsync: bool
+    metadata: Mapping[str, bytes | str]
 
     _buffer: list[SomeRecord]
     _columns: list
     _ipc_path: Path
+    _stream_writer: ipc.RecordBatchStreamWriter
 
     def __init__(
         self,
-        path: str | Path,
+        path: os.PathLike | str,
         schema: pa.Schema,
         batch_size: int = 1000,
         rowgroup_size: int = 256 * 1024,
         fsync: bool = True,
+        metadata: Mapping[str, bytes | str] = {},
     ):
         self.path = Path(path)
         if self.path.suffix == ".parquet":
@@ -73,7 +76,14 @@ class StreamingParquetWriter:
 
         # Open append-only stream
         self._sink = open(self._ipc_path, "ab")
-        self._writer = ipc.new_stream(self._sink, schema)
+        self._stream_writer = ipc.new_stream(self._sink, schema)
+
+        self.metadata = metadata
+        # Write metadata to temp file (in case of crash before parquet file is
+        # written).
+        pq.write_metadata(
+            self.schema.with_metadata(metadata), self._metadata_path(self.path)
+        )
 
     def __enter__(self):
         return self
@@ -104,7 +114,7 @@ class StreamingParquetWriter:
 
     def write_batch(self, batch: pa.RecordBatch):
         """Write a pyarrow RecordBatch immediately."""
-        self._writer.write_batch(batch)
+        self._stream_writer.write_batch(batch)
 
         # durability
         self._sink.flush()
@@ -118,19 +128,24 @@ class StreamingParquetWriter:
         if self._buffer:
             self._flush()
 
-        self._writer.close()
+        self._stream_writer.close()
         self._sink.close()
 
         # Convert IPC → Parquet
         self.stream_to_parquet(
-            self._ipc_path, self.path, rowgroup_size=self.rowgroup_size
+            self._ipc_path,
+            self.path,
+            rowgroup_size=self.rowgroup_size,
+            schema=self.schema,
+            metadata=self.metadata,
         )
 
         if delete_ipc:
-            try:
-                os.remove(self._ipc_path)
-            except FileNotFoundError:
-                pass
+            for f in [self._ipc_path, self._metadata_path(self.path)]:
+                try:
+                    os.remove(f)
+                except FileNotFoundError:
+                    pass
 
     @property
     def ipc_path(self):
@@ -139,6 +154,10 @@ class StreamingParquetWriter:
     # ----------------------------
     # Internal methods
     # ----------------------------
+
+    @staticmethod
+    def _metadata_path(pq_path: os.PathLike | str) -> Path:
+        return Path(pq_path).with_suffix(".parquet_metadata")
 
     def _flush(self):
         """
@@ -159,9 +178,15 @@ class StreamingParquetWriter:
         self._buffer.clear()
         self.write_batch(batch)
 
-    @staticmethod
+    @classmethod
     def stream_to_parquet(
-        ipc_path: Path | str, parquet_path: Path | str, rowgroup_size: None | int = None
+        cls,
+        ipc_path: os.PathLike | str,
+        parquet_path: os.PathLike | str,
+        rowgroup_size: None | int = None,
+        detect_metadata_file=True,
+        schema: pa.Schema = None,
+        metadata: Mapping[str, str | bytes] = {},
     ) -> int:
         """
         Recover valid batches from Arrow IPC streaming file and write to parquet.
@@ -181,6 +206,25 @@ class StreamingParquetWriter:
         batches = []
         at_end = False
 
+        # Try to read schema and optional metadata from a metadata file written by this class
+        if schema is None and detect_metadata_file:
+            metadata_file = cls._metadata_path(parquet_path)
+            try:
+                with pq.ParquetFile(metadata_file) as pf:
+                    schema = pf.schema_arrow
+                    metadata = {
+                        k: v
+                        for k, v in pf.metadata.metadata.items()
+                        if not k.startswith(b"ARROW:")
+                    }
+            except FileNotFoundError:
+                pass
+
+        if schema is not None:
+            writer = pq.ParquetWriter(parquet_path, schema=schema)
+            if metadata:
+                writer.add_key_value_metadata(metadata)
+
         with open(ipc_path, "rb") as f:
             reader = ipc.open_stream(f)
 
@@ -192,6 +236,8 @@ class StreamingParquetWriter:
                 else:
                     if writer is None:
                         writer = pq.ParquetWriter(parquet_path, batch.schema)
+                        if metadata:
+                            writer.add_key_value_metadata(metadata)
                     batches.append(batch)
                     n_records += batch.num_rows
 
