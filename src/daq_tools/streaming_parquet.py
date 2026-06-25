@@ -273,7 +273,12 @@ class StreamingParquetWriter:
                 pass
 
         if schema is not None:
-            writer = pq.ParquetWriter(parquet_path, schema=schema)
+            writer = pq.ParquetWriter(
+                parquet_path,
+                schema=schema,
+                data_page_version="2.0",
+                write_page_checksum=True,
+            )
             if metadata:
                 writer.add_key_value_metadata(metadata)
 
