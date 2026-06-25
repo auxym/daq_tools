@@ -11,8 +11,7 @@ type SomeRecord = Mapping[str, Any] | Sequence[Any]
 
 
 class StreamingParquetWriter:
-    """
-    Writes data to Arrow IPC stream format and convert to parquet on close.
+    """Writes data to Arrow IPC stream format and converts to parquet on close.
 
     Use `write` to append a single row. Rows are buffered until the buffer
     reaches `batch_size` rows, at which point a RecordBatch is written to the
@@ -23,19 +22,6 @@ class StreamingParquetWriter:
 
     In case of improper termination, valid data that was written to the stream
     file can be recovered with `stream_to_parquet`.
-
-    Args:
-        path: Path of the parquet file to be written.
-        schema: Arrow schema
-        batch_size: Number of records written to the Arrow IPC Streaming file
-            at a time. In case of a crash, this is the maximum data loss.
-        rowgroup_size: Size of the row groups written in the final parquet
-            file. This can be tuned for performance reasons.
-        fsync: If `True` (default), call fsync after every write to the Arrow
-            IPC file.
-
-    Attributes:
-        ipc_path: Path of the temporary Arrow IPC Streaming file.
 
     """
 
@@ -60,6 +46,21 @@ class StreamingParquetWriter:
         fsync: bool = True,
         metadata: Mapping[str, bytes | str] = {},
     ):
+        """
+        Args:
+            path: Path of the parquet file to be written.
+            schema: Arrow schema defining the structure of the data.
+            batch_size: Number of records written to the Arrow IPC Streaming file
+                at a time. In case of a crash, this is the maximum data loss.
+                Defaults to 1000.
+            rowgroup_size: Size of the row groups written in the final parquet
+                file. This can be tuned for performance reasons. Defaults to 256KB.
+            fsync: If True (default), call fsync after every write to the Arrow
+                IPC file for durability.
+            metadata: Arbitrary key-value metadata that will be written to the
+                parquet file metadata. Keys and values should be strings or bytes.
+        """
+
         self.path = Path(path)
         if self.path.suffix == ".parquet":
             self._ipc_path = self.path.with_suffix(".arrows")
@@ -97,11 +98,19 @@ class StreamingParquetWriter:
     # ----------------------------
 
     def write(self, record: SomeRecord):
-        """Add a single record (dict or sequence).
+        """Add a single record to the buffer.
 
-        Records are buffered until the buffer reaches `batch_size` buffers, at which
+        Records are buffered until the buffer reaches `batch_size` records, at which
         point a RecordBatch is written to the stream file.
+
+        Args:
+            record: A single record, either as a dict mapping column names to values,
+                or as a sequence of values corresponding to schema fields in order.
+
+        Raises:
+            ValueError: If the length of the record does not match the schema length.
         """
+
         if len(record) != len(self.schema):
             raise ValueError(
                 f"Length of record {len(record)} does not match schema length ({len(self.schema)})"
@@ -113,7 +122,15 @@ class StreamingParquetWriter:
             self._flush()
 
     def write_batch(self, batch: pa.RecordBatch):
-        """Write a pyarrow RecordBatch immediately."""
+        """Write a pyarrow RecordBatch immediately.
+
+        This bypasses the buffer and writes the batch directly to the stream file.
+        Useful for performance when you already have record batches prepared.
+
+        Args:
+            batch: A pyarrow RecordBatch to write to the stream.
+        """
+
         self._stream_writer.write_batch(batch)
 
         # durability
@@ -122,9 +139,17 @@ class StreamingParquetWriter:
             os.fsync(self._sink.fileno())
 
     def close(self, delete_ipc=False):
+        """Flush remaining data, close IPC stream, and convert to Parquet.
+
+        This method flushes any buffered records to the stream file, closes the
+        stream writer, and then converts the Arrow IPC stream to a Parquet file.
+        If delete_ipc is True, the temporary .arrows and metadata files are deleted.
+
+        Args:
+            delete_ipc: If True, delete the temporary Arrow IPC stream file after
+                conversion. Defaults to False for recovery purposes.
         """
-        Flush remaining data, close IPC, convert to Parquet.
-        """
+
         if self._buffer:
             self._flush()
 
@@ -149,6 +174,12 @@ class StreamingParquetWriter:
 
     @property
     def ipc_path(self):
+        """Get the path to the temporary Arrow IPC streaming file.
+
+        Returns:
+            Path: Path to the .arrows file where stream data is buffered.
+        """
+
         return self._ipc_path
 
     # ----------------------------
@@ -160,8 +191,11 @@ class StreamingParquetWriter:
         return Path(pq_path).with_suffix(".parquet_metadata")
 
     def _flush(self):
-        """
-        Convert buffered rows into Arrow arrays and write a batch.
+        """Convert buffered rows into Arrow arrays and write a batch.
+
+        Transforms the accumulated records in the buffer into a pyarrow RecordBatch
+        and writes it to the stream file. Handles both dict records (name: value
+        mappings) and sequence records (ordered values).
         """
         # Convert buffer into columnar structure
         if isinstance(self._buffer[0], abc.Mapping):
@@ -188,9 +222,27 @@ class StreamingParquetWriter:
         schema: pa.Schema = None,
         metadata: Mapping[str, str | bytes] = {},
     ) -> int:
-        """
-        Recover valid batches from Arrow IPC streaming file and write to parquet.
-        (streamed, memory efficient).
+        """Convert Arrow IPC streaming file to Parquet format.
+
+        Reads batches from the Arrow IPC streaming file and writes them to a Parquet
+        file in a memory-efficient, streaming manner. Useful for recovering data
+        from an .arrows file after improper termination.
+
+        Args:
+            ipc_path: Path to the Arrow IPC streaming file (.arrows).
+            parquet_path: Path for the output Parquet file.
+            rowgroup_size: Target size for row groups in the Parquet file. If None,
+                each batch becomes a separate row group. Defaults to None.
+            detect_metadata_file: If True, attempt to read schema and metadata from
+                a .parquet_metadata file if schema is not provided. Defaults to True.
+            schema: Arrow schema to use for the Parquet file. If None and
+                detect_metadata_file is True, will attempt to read from metadata file.
+            metadata: Key-value metadata to write to the Parquet file. If schema
+                is provided and metadata is empty, will attempt to read from metadata
+                file if detect_metadata_file is True.
+
+        Returns:
+            int: Total number of records written to the Parquet file.
         """
 
         def write_row_group(writer, batches):
