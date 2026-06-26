@@ -8,7 +8,10 @@ import time
 
 import pyarrow as pa
 
+from statistics import median
+
 from daq_tools import StreamingParquetWriter
+
 
 def create_data(num_rows):
     tt = np.linspace(0, 600, num_rows)
@@ -38,18 +41,21 @@ def bench_streaming_parquet(total_rows, batch_size):
             Path(parent) / "tmp.parquet", schema=schema, batch_size=batch_size
         )
 
-        tic = time.perf_counter()
+        tic = time.perf_counter_ns()
         for _ in range(n_iter):
             for row in batch_data:
                 writer.write(row)
-        toc = time.perf_counter()
+        toc = time.perf_counter_ns()
         writer.close()
 
         elapsed = toc - tic
         return elapsed
 
 if __name__ == "__main__":
-    total_rows = 10_000_000
+    total_rows = 100_000
     batch_size = 1000
-    elapsed = bench_streaming_parquet(total_rows, batch_size)
-    print(f"Wrote {total_rows} rows in {elapsed:.3f} seconds (batch size = {batch_size})")
+    elapsed = []
+    for _ in range(50):
+        elapsed.append(bench_streaming_parquet(total_rows, batch_size) // 1e6)
+        print(f"Wrote {total_rows} rows in {elapsed[-1]} ms (batch size = {batch_size})")
+    print(f"Min: {min(elapsed)} ms Median: {median(elapsed)} ms")

@@ -1,4 +1,5 @@
 import os
+import sys
 import threading
 from typing import Sequence, Mapping, Any
 from pathlib import Path
@@ -32,12 +33,12 @@ class StreamingParquetWriter:
     """
 
     path: Path
-    schema: pa.Schema
     batch_size: int
     rowgroup_size: int
     do_fsync: bool
     metadata: Mapping[str, bytes | str]
 
+    _schema: pa.Schema
     _buffer: list[SomeRecord]
     _ipc_path: Path
     _stream_writer: ipc.RecordBatchStreamWriter
@@ -45,6 +46,8 @@ class StreamingParquetWriter:
     _write_queue: Queue[list[SomeRecord]]
     _writer_thread: threading.Thread
     _closed: bool
+    _thread_exc: tuple | None
+    _columns: set[str]
 
     def __init__(
         self,
@@ -76,7 +79,8 @@ class StreamingParquetWriter:
         else:
             self._ipc_path = Path(str(self.path) + ".arrows")
 
-        self.schema = schema
+        self._schema = schema
+        self._columns = set(self._schema.names)
         self.batch_size = batch_size
         self.rowgroup_size = rowgroup_size
         self.do_fsync = fsync
@@ -92,13 +96,14 @@ class StreamingParquetWriter:
 
         self.metadata = metadata
         pq.write_metadata(
-            self.schema.with_metadata(metadata), self._metadata_path(self.path)
+            self._schema.with_metadata(metadata), self._metadata_path(self.path)
         )
 
         self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
         self._writer_thread.start()
 
         self._closed = False
+        self._thread_exc = None
 
     def __enter__(self):
         return self
@@ -127,16 +132,20 @@ class StreamingParquetWriter:
         if self._closed:
             raise ValueError("Writer is closed")
 
-        if len(record) != len(self.schema):
+        self._check_thread_exc()
+
+        if len(record) != len(self._schema):
             raise ValueError(
-                f"Length of record {len(record)} does not match schema length ({len(self.schema)})"
+                f"Length of record {len(record)} does not match schema length ({len(self._schema)})"
             )
+
+        if isinstance(record, abc.Mapping) and record.keys() != self._columns:
+            raise ValueError(f"Record keys ({record.keys()}) do not match the schema.")
 
         self._buffer.append(record)
 
         if len(self._buffer) >= self.batch_size:
-            self._write_queue.put(self._buffer)
-            self._buffer = []
+            self._non_blocking_flush()
 
     def write_batch(self, batch: pa.RecordBatch):
         """Write a pyarrow RecordBatch immediately and block until written.
@@ -162,10 +171,16 @@ class StreamingParquetWriter:
         This method flushes any buffered records to the stream file and
         blocks until the data has been written.
         """
-        if self._buffer:
-            batch = self._buffer_to_batch(self._buffer, self.schema)
-            self._buffer = []
-            self.write_batch(batch)
+        if self._closed:
+            raise ValueError("Writer is closed")
+
+        # Add current buffer to write queue
+        self._non_blocking_flush()
+
+        # Wait until everything in the queue (current buffer and possibly previous batches)
+        # have been written, and then check for errors in writer thread.
+        self._write_queue.join()
+        self._check_thread_exc()
 
     def close(self, delete_ipc=False):
         """Flush remaining data, close IPC stream, and convert to Parquet.
@@ -178,31 +193,31 @@ class StreamingParquetWriter:
             delete_ipc: If True, delete the temporary Arrow IPC stream file after
                 conversion. Defaults to False for recovery purposes.
         """
+        if self._closed:
+            return
 
-        # First, wait for any in-flight writes from previous async flushes
-        # Non-immediate shutdown will allow get() until queue is empty, then
-        # raise Shutdown, at which point the thread will exit.
-        self._write_queue.shutdown(immediate=False)
-        self._writer_thread.join()
-
-        # Then flush any remaining buffer (blocking)
-        self.flush()
+        # Add current buffer to write queue if not empty
+        self._non_blocking_flush()
 
         # Need to wait until all existing data is written before setting _closed,
         # otherwise we will generate an exception.
+        self._write_queue.shutdown(immediate=False)
+        self._writer_thread.join()
         self._closed = True
 
-        # Close the IPC stream file
         with self._stream_lock:
             self._stream_writer.close()
             self._sink.close()
+
+        # Raises the thread exception if it was not already raised
+        self._check_thread_exc()
 
         # Convert IPC → Parquet
         self.stream_to_parquet(
             self._ipc_path,
             self.path,
             rowgroup_size=self.rowgroup_size,
-            schema=self.schema,
+            schema=self._schema,
             metadata=self.metadata,
         )
 
@@ -231,6 +246,25 @@ class StreamingParquetWriter:
     # Internal methods
     # ----------------------------
 
+    def __del__(self):
+        # Minimal cleanup on unexpected exit
+        # Should eventually stop the writer thread
+        self._write_queue.shutdown()
+
+    def _check_thread_exc(self):
+        if self._thread_exc:
+            exc_type, exc_value, exc_tb = self._thread_exc
+            self._thread_exc = None
+
+            # Re-raise exception to be handled by caller
+            raise exc_value.with_traceback(exc_tb)
+
+    def _non_blocking_flush(self):
+        if not self._buffer:
+            return
+        self._write_queue.put(self._buffer)
+        self._buffer = []
+
     @staticmethod
     def _buffer_to_batch(buffer: list[SomeRecord], schema: pa.Schema) -> pa.RecordBatch:
         """Convert buffer to a RecordBatch."""
@@ -256,11 +290,17 @@ class StreamingParquetWriter:
             try:
                 rows = self._write_queue.get()
             except ShutDown:
-                break  # exit loop and stop thread
+                break
 
-            batch = self._buffer_to_batch(rows, self.schema)
-            with self._stream_lock:
-                self._stream_writer.write_batch(batch)
+            try:
+                batch = self._buffer_to_batch(rows, self._schema)
+                with self._stream_lock:
+                    self._stream_writer.write_batch(batch)
+            except Exception:
+                # Store exception so it is re-raised in main thread
+                self._thread_exc = sys.exc_info()
+            finally:
+                self._write_queue.task_done()
 
     @staticmethod
     def _try_read_metadata_file(

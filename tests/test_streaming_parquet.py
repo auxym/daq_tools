@@ -411,3 +411,86 @@ def test_write_non_blocking():
 
         table = pq.read_table(path)
         assert table.num_rows == 3
+
+
+def test_thread_exception_on_invalid_type():
+    """Test that exception in writer thread is propagated to caller."""
+    schema = pa.schema([("x", pa.int64())])
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "test.parquet"
+        writer = StreamingParquetWriter(path, schema, batch_size=10)
+
+        # Write invalid record - string cannot convert to int64
+        writer.write({"x": "not_an_int"})
+        writer.write({"x": 1})
+        writer.write({"x": 2})
+
+        # Flushing should raise the exception from the writer thread
+        with pytest.raises(pa.ArrowTypeError):
+            writer.flush()
+        writer.close()
+
+
+
+def test_thread_exception_on_write():
+    """Test that thread exception is raised on subsequent write calls."""
+    schema = pa.schema([("x", pa.int64())])
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "test.parquet"
+        writer = StreamingParquetWriter(path, schema, batch_size=3)
+
+        # Write records to trigger async flush with invalid data (first in buffer)
+        writer.write({"x": "bad_value"})
+        writer.write({"x": 1})
+        writer.write({"x": 2})
+
+        # Give thread time to process and hit the exception
+        import time
+        time.sleep(0.1)
+
+        # Next write should raise the cached exception
+        with pytest.raises(pa.ArrowTypeError):
+            writer.write({"x": 3})
+        writer.close()
+
+
+
+def test_thread_exception_on_close():
+    """Test that thread exception is raised when calling close."""
+    schema = pa.schema([("x", pa.int64())])
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "test.parquet"
+        writer = StreamingParquetWriter(path, schema, batch_size=3)
+
+        # Write invalid record at start of buffer
+        writer.write({"x": "invalid"})
+        writer.write({"x": 1})
+        writer.write({"x": 2})
+
+        # close() should raise the exception since batch will be flushed
+        with pytest.raises(pa.ArrowTypeError):
+            writer.close()
+
+        assert writer.closed
+
+
+def test_thread_exception_with_sequence_record():
+    """Test thread exception when sequence record has wrong type."""
+    schema = pa.schema([("a", pa.int64()), ("b", pa.string())])
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "test.parquet"
+        writer = StreamingParquetWriter(path, schema, batch_size=10)
+
+        writer.write((1, "one"))
+        writer.write((2, "two"))
+
+        # Third record has wrong type (int where string expected)
+        writer.write((3, 123))
+
+        with pytest.raises(pa.ArrowTypeError):
+            writer.flush()
+        writer.close()
