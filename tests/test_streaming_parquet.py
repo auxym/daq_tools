@@ -308,8 +308,15 @@ def test_metadata_recovery_after_crash():
         metadata_path = Path(tmpdir) / "output.parquet_metadata"
 
         # Create writer and write data (but don't close - simulate crash)
-        writer = StreamingParquetWriter(path, schema, metadata=metadata, batch_size=1)
-        writer.write({"val": 42})  # batch_size=1 so this flushes immediately
+        writer = StreamingParquetWriter(path, schema, metadata=metadata, batch_size=1000)
+        writer.write({"val": 42})
+
+        # Wait for data to be written to IPC (non-blocking write with batch_size=1000)
+        writer.flush()
+
+        # Signal shutdown to stop the writer thread before closing stream
+        writer._write_queue.shutdown(immediate=False)
+        writer._writer_thread.join()
 
         # Verify metadata file was created
         assert metadata_path.exists()
@@ -332,3 +339,75 @@ def test_metadata_recovery_after_crash():
             assert file_metadata is not None
             assert file_metadata[b"source"] == b"crash_recovery"
             assert file_metadata[b"run_id"] == b"12345"
+
+
+def test_write_batch_blocks():
+    """Test that write_batch blocks until data is written."""
+    schema = pa.schema([("x", pa.int64())])
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "test.parquet"
+        writer = StreamingParquetWriter(path, schema)
+
+        batch = pa.RecordBatch.from_arrays([[1, 2, 3]], names=["x"])
+
+        import time
+        start = time.perf_counter()
+        writer.write_batch(batch)
+        elapsed = time.perf_counter() - start
+
+        # write_batch should block until completed
+        assert elapsed < 0.1, "write_batch took too long - should be synchronous"
+
+        writer.close(delete_ipc=True)
+
+        table = pq.read_table(path)
+        assert table.num_rows == 3
+
+
+def test_flush_blocks():
+    """Test that flush blocks until data is written."""
+    schema = pa.schema([("x", pa.int64())])
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "test.parquet"
+        writer = StreamingParquetWriter(path, schema, batch_size=1000)
+
+        for i in range(5):
+            writer.write({"x": i})
+
+        import time
+        start = time.perf_counter()
+        writer.flush()
+        elapsed = time.perf_counter() - start
+
+        # flush should block until completed
+        assert elapsed < 0.5, f"flush took too long - should be synchronous ({elapsed}s)"
+
+        writer.close(delete_ipc=True)
+
+        table = pq.read_table(path)
+        assert table.num_rows == 5
+
+
+def test_write_non_blocking():
+    """Test that write is non-blocking when batch_size is reached."""
+    schema = pa.schema([("x", pa.int64())])
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "test.parquet"
+        writer = StreamingParquetWriter(path, schema, batch_size=3)
+
+        import time
+        start = time.perf_counter()
+        for i in range(3):
+            writer.write({"x": i})
+        elapsed = time.perf_counter() - start
+
+        # write should not block significantly when batch is flushed to queue
+        assert elapsed < 0.1, "write took too long - should be non-blocking"
+
+        writer.close(delete_ipc=True)
+
+        table = pq.read_table(path)
+        assert table.num_rows == 3
