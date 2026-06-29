@@ -37,19 +37,17 @@ def bench_streaming_parquet(total_rows, batch_size):
     })
 
     with tempfile.TemporaryDirectory() as parent:
-        writer = StreamingParquetWriter(
+        with StreamingParquetWriter(
             Path(parent) / "tmp.parquet", schema=schema, batch_size=batch_size
-        )
+        ) as writer:
+            tic = time.perf_counter_ns()
+            for _ in range(n_iter):
+                for row in batch_data:
+                    writer.write(row)
+            toc = time.perf_counter_ns()
 
-        tic = time.perf_counter_ns()
-        for _ in range(n_iter):
-            for row in batch_data:
-                writer.write(row)
-        toc = time.perf_counter_ns()
-        writer.close()
-
-        elapsed = toc - tic
-        return elapsed
+    elapsed = toc - tic
+    return elapsed
 
 if __name__ == "__main__":
     total_rows = 100_000

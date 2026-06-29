@@ -248,8 +248,13 @@ class StreamingParquetWriter:
 
     def __del__(self):
         # Minimal cleanup on unexpected exit
-        # Should eventually stop the writer thread
+        # Stop the writer thread
         self._write_queue.shutdown()
+        self._writer_thread.join()
+        try:
+            self._sink.close()
+        except Exception:
+            pass
 
     def _check_thread_exc(self):
         if self._thread_exc:
