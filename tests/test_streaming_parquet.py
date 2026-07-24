@@ -115,9 +115,7 @@ def test_write_parquet_from_ipc_static(tmp_path):
             )
             writer.write_batch(batch)
 
-    count = StreamingParquetWriter.stream_to_parquet(
-        str(ipc_path), parquet_path
-    )
+    count = StreamingParquetWriter.stream_to_parquet(str(ipc_path), parquet_path)
 
     assert count == 2
     assert parquet_path.exists()
@@ -224,9 +222,7 @@ def test_write_batch(tmp_path):
     schema = pa.schema([("x", pa.int64()), ("y", pa.float64())])
     path = tmp_path / "test.parquet"
 
-    batch = pa.RecordBatch.from_arrays(
-        [[1, 2, 3], [1.0, 2.0, 3.0]], names=["x", "y"]
-    )
+    batch = pa.RecordBatch.from_arrays([[1, 2, 3], [1.0, 2.0, 3.0]], names=["x", "y"])
     with StreamingParquetWriter(path, schema) as writer:
         writer.write_batch(batch)
 
@@ -331,7 +327,9 @@ def test_flush_blocks(tmp_path):
         elapsed = time.perf_counter() - start
 
         # flush should block until completed
-        assert elapsed < 0.5, f"flush took too long - should be synchronous ({elapsed}s)"
+        assert elapsed < 0.5, (
+            f"flush took too long - should be synchronous ({elapsed}s)"
+        )
 
     table = pq.read_table(path)
     assert table.num_rows == 5
@@ -386,6 +384,7 @@ def test_thread_exception_on_write(tmp_path):
 
         # Give thread time to process and hit the exception
         import time
+
         time.sleep(0.1)
 
         # Next write should raise the cached exception
@@ -424,3 +423,42 @@ def test_thread_exception_with_sequence_record(tmp_path):
 
         with pytest.raises(pa.ArrowTypeError):
             writer.flush()
+
+
+def test_stream_compression(tmp_path):
+    """Test that stream_compression option is applied to writer_options."""
+    schema = pa.schema([("id", pa.int64()), ("name", pa.string())])
+    path = tmp_path / "test.parquet"
+    codecs = ["lz4", "zstd", pa.Codec("zstd", compression_level=3), None]
+    for c in codecs:
+        # pyarrow doesn't provide a way to check compression on a IPC stream file, so we just smoke
+        # test the writer and check that nothing crashes.
+        with StreamingParquetWriter(
+            path, schema, batch_size=100, stream_compression=c
+        ) as writer:
+            for i in range(100):
+                writer.write({"id": i, "name": f"name_{i}"})
+            writer.flush()
+            assert writer.ipc_path.exists()
+
+
+def test_parquet_compression(tmp_path):
+    """Test stream_to_parquet static method with compression options."""
+    schema = pa.schema([("key", pa.string()), ("num", pa.int64())])
+    ipc_path = tmp_path / "stream.arrows"
+    parquet_path = tmp_path / "output.parquet"
+
+    with open(ipc_path, "wb") as sink:
+        with ipc.new_stream(sink, schema) as writer:
+            batch = pa.RecordBatch.from_pylist(
+                [{"key": "a", "num": 1}, {"key": "b", "num": 2}]
+            )
+            writer.write_batch(batch)
+
+    count = StreamingParquetWriter.stream_to_parquet(
+        ipc_path, parquet_path, writer_options={"compression": "lz4"}
+    )
+
+    assert count == 2
+    with pq.ParquetFile(parquet_path) as pf:
+        assert pf.metadata.row_group(0).column(0).compression == "LZ4"

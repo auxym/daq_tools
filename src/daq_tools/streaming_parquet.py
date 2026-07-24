@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import os
 import sys
 import threading
-from typing import Sequence, Mapping, Any
+from typing import Sequence, Mapping, Any, Literal
 from pathlib import Path
 from collections import abc
 from queue import Queue, ShutDown
@@ -11,6 +13,7 @@ import pyarrow.ipc as ipc
 import pyarrow.parquet as pq
 
 type SomeRecord = Mapping[str, Any] | Sequence[Any]
+type StreamCompression = Literal["lz4", "zstd"] | pa.Codec | None
 
 
 class StreamingParquetWriter:
@@ -37,6 +40,7 @@ class StreamingParquetWriter:
     rowgroup_size: int
     do_fsync: bool
     metadata: Mapping[str, bytes | str]
+    stream_options: ipc.IpcWriteOptions
 
     _schema: pa.Schema
     _buffer: list[SomeRecord]
@@ -57,6 +61,7 @@ class StreamingParquetWriter:
         rowgroup_size: int = 256 * 1024,
         fsync: bool = True,
         metadata: Mapping[str, bytes | str] = {},
+        stream_compression: StreamCompression = None,
     ):
         """
         Args:
@@ -71,6 +76,9 @@ class StreamingParquetWriter:
                 IPC file for durability.
             metadata: Arbitrary key-value metadata that will be written to the
                 parquet file metadata. Keys and values should be strings or bytes.
+            stream_compression: Compression codec for the IPC stream and Parquet
+                output. Can be a string ("lz4" or "zstd") or a pyarrow.Codec object.
+                If None, no compression is applied.
         """
 
         self.path = Path(path)
@@ -91,8 +99,9 @@ class StreamingParquetWriter:
         self._write_queue = Queue(maxsize=10)
 
         # Open append-only stream
+        self.stream_options = ipc.IpcWriteOptions(compression=stream_compression)
         self._sink = open(self._ipc_path, mode="ab", buffering=0)
-        self._stream_writer = ipc.new_stream(self._sink, schema)
+        self._stream_writer = ipc.new_stream(self._sink, schema, options=self.stream_options)
 
         self.metadata = metadata
         pq.write_metadata(
@@ -330,15 +339,22 @@ class StreamingParquetWriter:
         filepath: os.PathLike | str,
         schema: pa.Schema,
         metadata: Mapping[str, Any] | None,
+        writer_options: Mapping[str, Any] = {},
     ) -> pq.ParquetWriter:
-        writer = pq.ParquetWriter(
-            filepath,
-            schema=schema,
-            data_page_version="2.0",
-            write_page_checksum=True,
-        )
+
+        options = {
+            "data_page_version": "2.0",
+            "write_page_checksum": True,
+        }
+        options.update(writer_options)
+        if "schema" in options:
+            del options["schema"]
+
+        writer = pq.ParquetWriter(filepath, schema=schema, **options)
+
         if metadata:
             writer.add_key_value_metadata(metadata)
+
         return writer
 
     @classmethod
@@ -350,6 +366,7 @@ class StreamingParquetWriter:
         detect_metadata_file=True,
         schema: pa.Schema = None,
         metadata: Mapping[str, str | bytes] = {},
+        writer_options: Mapping[str, Any] = {},
     ) -> int:
         """Convert Arrow IPC streaming file to Parquet format.
 
@@ -369,6 +386,8 @@ class StreamingParquetWriter:
             metadata: Key-value metadata to write to the Parquet file. If schema
                 is provided and metadata is empty, will attempt to read from metadata
                 file if detect_metadata_file is True.
+            writer_options: Options to pass to pyarrow.parquet.ParquetWriter
+                when writing the parquet file. 
 
         Returns:
             int: Total number of records written to the Parquet file.
@@ -394,7 +413,9 @@ class StreamingParquetWriter:
             )
 
         if schema is not None:
-            writer = cls._create_parquet_writer(parquet_path, schema, metadata)
+            writer = cls._create_parquet_writer(
+                parquet_path, schema, metadata, writer_options
+            )
 
         with open(ipc_path, "rb") as f:
             reader = ipc.open_stream(f)
@@ -407,7 +428,7 @@ class StreamingParquetWriter:
                 else:
                     if writer is None:
                         writer = cls._create_parquet_writer(
-                            parquet_path, batch.schema, metadata
+                            parquet_path, batch.schema, metadata, writer_options
                         )
                     batches.append(batch)
                     batch_rows += batch.num_rows
